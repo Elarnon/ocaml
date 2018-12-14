@@ -551,6 +551,10 @@ let mk_no_unboxed_types f =
   " unannotated unboxable types will not be unboxed (default)"
 ;;
 
+let mk_trmc f =
+  "-force-trmc", Arg.Unit f, " Rewrite all possible trmc calls"
+;;
+
 let mk_unsafe f =
   "-unsafe", Arg.Unit f,
   " Do not compile bounds checking on array and string access"
@@ -910,6 +914,7 @@ module type Common_options = sig
   val _no_strict_sequence : unit -> unit
   val _strict_formats : unit -> unit
   val _no_strict_formats : unit -> unit
+  val _trmc : unit -> unit
   val _unboxed_types : unit -> unit
   val _no_unboxed_types : unit -> unit
   val _unsafe_string : unit -> unit
@@ -1203,6 +1208,7 @@ struct
     mk_strict_formats F._strict_formats;
     mk_no_strict_formats F._no_strict_formats;
     mk_thread F._thread;
+    mk_trmc F._trmc;
     mk_unboxed_types F._unboxed_types;
     mk_no_unboxed_types F._no_unboxed_types;
     mk_unsafe F._unsafe;
@@ -1400,6 +1406,7 @@ struct
     mk_strict_formats F._strict_formats;
     mk_no_strict_formats F._no_strict_formats;
     mk_thread F._thread;
+    mk_trmc F._trmc;
     mk_unbox_closures F._unbox_closures;
     mk_unbox_closures_factor F._unbox_closures_factor;
     mk_inline_max_unroll F._inline_max_unroll;
@@ -1596,6 +1603,7 @@ struct
     mk_strict_formats F._strict_formats;
     mk_no_strict_formats F._no_strict_formats;
     mk_thread F._thread;
+    mk_trmc F._trmc;
     mk_unboxed_types F._unboxed_types;
     mk_no_unboxed_types F._no_unboxed_types;
     mk_unsafe_string F._unsafe_string;
@@ -1891,6 +1899,7 @@ module Default = struct
     let _noprompt = set noprompt
     let _nopromptcont = set nopromptcont
     let _stdin () = (* placeholder: file_argument ""*) ()
+    let _trmc = set force_trmc
     let _version () = print_version ()
     let _vnum () = print_version_num ()
   end
@@ -1926,6 +1935,7 @@ module Default = struct
         "Profiling with \"gprof\" (option `-p') is only supported up to \
          OCaml 4.08.0"
     let _shared () = shared := true; dlcode := true
+    let _trmc = set force_trmc
     let _v () = print_version_and_library "native-code compiler"
   end
 
@@ -1946,6 +1956,7 @@ module Default = struct
     let _pp s = Clflags.preprocessor := (Some s)
     let _ppx s = Clflags.all_ppx := (s :: (!Clflags.all_ppx))
     let _thread = set Clflags.use_threads
+    let _trmc = set force_trmc
     let _v () = Compenv.print_version_and_library "documentation generator"
     let _verbose = set Clflags.verbose
     let _version = Compenv.print_version_string
@@ -1979,6 +1990,7 @@ third-party libraries such as Lwt, but with a different API."
     let _output_complete_exe () =
       _output_complete_obj (); output_complete_executable := true
     let _output_obj () = output_c_object := true; custom_runtime := true
+    let _trmc = set force_trmc
     let _use_prims s = use_prims := s
     let _use_runtime s = use_runtime := s
     let _v () = print_version_and_library "compiler"

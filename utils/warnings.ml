@@ -92,6 +92,9 @@ type t =
   | Redefining_unit of string               (* 65 *)
   | Unused_open_bang of string              (* 66 *)
   | Unused_functor_parameter of string      (* 67 *)
+  | Invalid_trmc_attribute                  (* 68 *)
+  | Unused_trmc_attribute                   (* 69 *)
+  | Potential_trmc_call                     (* 70 *)
 ;;
 
 (* If you remove a warning, leave a hole in the numbering.  NEVER change
@@ -170,9 +173,12 @@ let number = function
   | Redefining_unit _ -> 65
   | Unused_open_bang _ -> 66
   | Unused_functor_parameter _ -> 67
+  | Invalid_trmc_attribute -> 68
+  | Unused_trmc_attribute -> 69
+  | Potential_trmc_call -> 70
 ;;
 
-let last_warning_number = 67
+let last_warning_number = 70
 ;;
 
 (* Must be the max number returned by the [number] function. *)
@@ -319,8 +325,8 @@ let parse_alert_option s =
   in
   scan 0
 
-let parse_opt error active errflag s =
-  let flags = if errflag then error else active in
+let parse_opt errors active errflag s =
+  let flags = if errflag then errors else active in
   let set i =
     if i = 3 then set_alert ~error:errflag ~enable:true "deprecated"
     else flags.(i) <- true
@@ -336,7 +342,7 @@ let parse_opt error active errflag s =
     end
     else begin
       active.(i) <- true;
-      error.(i) <- true
+      errors.(i) <- true
     end
   in
   let error () = raise (Arg.Bad "Ill-formed list of warnings") in
@@ -393,7 +399,7 @@ let parse_options errflag s =
   current := {(!current) with error; active}
 
 (* If you change these, don't forget to change them in man/ocamlc.m *)
-let defaults_w = "+a-4-6-7-9-27-29-30-32..42-44-45-48-50-60-66-67";;
+let defaults_w = "+a-4-6-7-9-27-29-30-32..42-44-45-48-50-60-66-67-70";;
 let defaults_warn_error = "-a+31";;
 
 let () = parse_options false defaults_w;;
@@ -632,6 +638,12 @@ let message = function
          which shadows the existing one.\n\
          Hint: Did you mean 'type %s = unit'?" name
   | Unused_functor_parameter s -> "unused functor parameter " ^ s ^ "."
+  | Invalid_trmc_attribute ->
+      "trmc attribute is only applicable on recursive function bindings"
+  | Unused_trmc_attribute ->
+      "this function is marked trmc but is never applied in trmc position"
+  | Potential_trmc_call ->
+      "this function is applied in trmc position"
 ;;
 
 let nerrors = ref 0;;
@@ -777,6 +789,9 @@ let descriptions =
    65, "Type declaration defining a new '()' constructor.";
    66, "Unused open! statement.";
    67, "Unused functor parameter.";
+   68, "Warning on non-recursive functions with @trmc attribute";
+   69, "Unused @trmc attribute";
+   70, "Warning on functions which would benefit from a @trmc attribute";
   ]
 ;;
 

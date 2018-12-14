@@ -94,6 +94,9 @@ type t =
   | Redefining_unit of string               (* 65 *)
   | Unused_open_bang of string              (* 66 *)
   | Unused_functor_parameter of string      (* 67 *)
+  | Invalid_trmc_attribute                  (* 68 *)
+  | Unused_trmc_attribute                   (* 69 *)
+  | Potential_trmc_call                     (* 70 *)
 ;;
 
 type alert = {kind:string; message:string; def:loc; use:loc}
