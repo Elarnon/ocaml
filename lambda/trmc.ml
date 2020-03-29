@@ -131,7 +131,7 @@ module Choice = struct
         calls. See the type [settable] below. *)
 
   and 'a settable = {
-    dps: offset destination -> 'a;
+    dps: tail:bool -> offset destination -> 'a;
     direct: unit -> 'a;
   }
   (**
@@ -141,6 +141,8 @@ module Choice = struct
      - If the surrounding context is already in destination-passing
        style, it has a destination available, we should produce the
        code in [dps] -- a function parametrized over the destination.
+       It passes the ~tail boolean to indicate whether the produced code
+       is used in tail position.
 
      - If the surrounding context is in direct style (no destination
        is available), we should produce the fallback code from
@@ -176,7 +178,7 @@ module Choice = struct
 
   let map_settable f s = {
     direct = (fun () -> f (s.direct ()));
-    dps = (fun dst -> f (s.dps dst));
+    dps = (fun ~tail dst -> f (s.dps ~tail dst));
   }
 
   let map f = function
@@ -193,7 +195,7 @@ module Choice = struct
     | Set s1, Set s2 ->
         Set {
           direct = (fun () -> s1.direct (), s2.direct ());
-          dps = (fun dst -> s1.dps dst, s2.dps dst);
+          dps = (fun ~tail dst -> s1.dps ~tail dst, s2.dps ~tail dst);
         }
 
   let (let+) c f = map f c
@@ -223,11 +225,11 @@ and candidate = {
   dps_id: Ident.t;
 }
 
-let set loc dst : lambda Choice.t -> lambda = function
+let set ~tail loc dst : lambda Choice.t -> lambda = function
   | Return t ->
       assign_to_dst loc dst t
   | Set settable ->
-      settable.dps dst
+      settable.dps ~tail dst
 
 let return : 'a Choice.t -> 'a = function
   | Return t -> t
@@ -355,12 +357,13 @@ let rec choice ctx t =
               raise No_trmc
           in
           Choice.Set {
-            dps = (fun dst ->
+            dps = (fun ~tail dst ->
               let f_dps = candidate.dps_id in
               Lapply { apply with
                        ap_func = Lvar f_dps;
                        ap_args = add_dst_args dst apply.ap_args;
-                       ap_tailcall = Should_be_tailcall;
+                       ap_tailcall =
+		         if tail then Should_be_tailcall else Default_tailcall;
                      });
             direct = (fun () -> Lapply apply);
           }
@@ -411,14 +414,14 @@ let rec choice ctx t =
         in
         let block_dst block_var = { var = block_var; offset = placeholder_pos_lam } in
         Choice.Set {
-          dps = (fun old_dst ->
+          dps = (fun ~tail old_dst ->
             let_block_in @@ fun block_var ->
             Lsequence(assign_to_dst loc old_dst (Lvar block_var),
-                      settable.dps (block_dst block_var))
+                      settable.dps ~tail (block_dst block_var))
           );
           direct = (fun () ->
             let_block_in @@ fun block_var ->
-            Lsequence(settable.dps (block_dst block_var),
+            Lsequence(settable.dps ~tail:false (block_dst block_var),
                       Lvar block_var)
           );
         }
@@ -535,7 +538,7 @@ and traverse_binding ctx (var, def) =
     let dst_lam = { dst with offset = Lvar dst.offset } in
     Lambda.duplicate @@ Lfunction { lfun with (* TODO check function_kind *)
       params = add_dst_params dst lfun.params;
-      body = Lambda.duplicate (set lfun.loc dst_lam cand_choice);
+      body = set ~tail:true lfun.loc dst_lam cand_choice;
     } in
   let dps_var = cand.dps_id in
   [(var, direct); (dps_var, dps)]
