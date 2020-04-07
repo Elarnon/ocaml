@@ -326,9 +326,10 @@ module Choice = struct
   and 'a settable = {
     dps: 'a Dps.t;
     direct: unit -> 'a;
+    benefits_from_dps: bool;
   }
   (**
-     A [{dps; direct}] record a code that may be written in destination-passing style
+     A [settable] record represents code that may be written in destination-passing style
      if its usage context allows it. More precisely:
 
      - If the surrounding context is already in destination-passing
@@ -344,6 +345,13 @@ module Choice = struct
       (Note: [direct] is also a function (on [unit]) to ensure that any
       effects performed during code production will only happen once we
       do know that we want to produce the direct-style code.)
+
+     The [benefits_from_dps] boolean indicates whether
+     the use of destination-passing-style is beneficial to this function,
+     in the sense that the [dps] version has strictly more recursive calls
+     to TRMC versions than the [direct] version. When [benefits_from_dps]
+     is false, there is no difference in number of TRMC sub-calls --
+     see the {!choice_makeblock} case.
   *)
 
   (** Finds the first [settable] element in a list [choices];
@@ -370,6 +378,7 @@ module Choice = struct
     in find []
 
   let map_settable f s = {
+    benefits_from_dps = s.benefits_from_dps;
     direct = (fun () -> f (s.direct ()));
     dps = Dps.map f s.dps;
   }
@@ -387,6 +396,7 @@ module Choice = struct
         Set (map_settable (fun v2 -> (v1, v2)) s2)
     | Set s1, Set s2 ->
         Set {
+          benefits_from_dps = s1.benefits_from_dps || s2.benefits_from_dps;
           direct = (fun () -> s1.direct (), s2.direct ());
           dps = Dps.pair s1.dps s2.dps;
         }
@@ -550,6 +560,7 @@ let rec choice ctx t =
               raise No_trmc
           in
           Choice.Set {
+            benefits_from_dps = true;
             dps = Dynamic (fun ~tail ~dst ->
               let f_dps = candidate.dps_id in
               Lapply { apply with
@@ -595,10 +606,19 @@ let rec choice ctx t =
         in
         let block_dst block_var = { var = block_var; offset = placeholder_pos_lam } in
         Choice.Set {
+          benefits_from_dps =
+            (* Whether or not the caller provides a destination,
+               we can always provide a destination to our settable
+               subterm, so the number of TRMC sub-calls is identical
+               in the [direct] and [dps] versions. *)
+            false;
           direct = (fun () ->
-            let_block_in @@ fun block_var ->
-            Lsequence(Dps.run settable.dps ~tail:false ~dst:(block_dst block_var),
-                      Lvar block_var)
+            if not settable.benefits_from_dps then
+              k flag (plug_args before (settable.direct ()) after)
+            else
+              let_block_in @@ fun block_var ->
+              Lsequence(Dps.run settable.dps ~tail:false ~dst:(block_dst block_var),
+                        Lvar block_var)
           );
           dps = Linear_static (fun ~tail ~dst ~delayed ->
             match settable.dps with
