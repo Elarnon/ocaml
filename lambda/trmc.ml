@@ -627,23 +627,44 @@ let rec choice ctx t =
                 Lsequence(assign_to_dst loc dst (delayed (Lvar block_var)),
                           dps ~tail ~dst:(block_dst block_var))
             | Linear_static dps ->
-                let bind_list start lambdas k =
-                  (* TODO optimization: no binding for variables and constants *)
-                  let bindings =
-                    lambdas |> List.mapi (fun i lam ->
-                      (Ident.create_local ("arg" ^ string_of_int (start+i))),
-                      lam)
-                  in
-                  let body = k (List.map fst bindings) in
-                  List.fold_right (fun (v,lam) body ->
-                    Llet(Strict, Pgenval, v, lam, body)
+                (* We are going to delay the application of the
+                   constructor to the place where our linear-static
+                   argument sets its destination. This may move the
+                   constructor application below some effectful
+                   expressions (if our subterm is of the form [foo;
+                   bar_with_trmc_inside] for example), and we want to
+                   preserve the evaluation order of the other
+                   arguments of the constructor. So we bind them here,
+                   unless are obviously side-effect-frees. *)
+                let bind_list name lambdas k =
+                  let can_be_delayed =
+                    (* Note that the delayed subterms will be used
+                       exactly once in the linear-static subterm. So
+                       we are happy to delay constants, which we would
+                       not want to duplicate. *)
+                    function
+                    | Lvar _ | Lconst _ -> true
+                    | _ -> false in
+                  let bindings, args =
+                    lambdas
+                    |> List.mapi (fun i lam ->
+                      if can_be_delayed lam then (None, lam)
+                      else begin
+                        let v = Ident.create_local (Printf.sprintf "arg_%s_%d" name i) in
+                        (Some (v, lam), Lvar v)
+                      end)
+                    |> List.split in
+                  let body = k args in
+                  List.fold_right (fun binding body ->
+                    match binding with
+                    | None -> body
+                    | Some (v, lam) -> Llet(Strict, Pgenval, v, lam, body)
                   ) bindings body
                 in
-                let vars = List.map (fun v -> Lvar v) in
-                bind_list 1 before @@ fun vbefore ->
-                bind_list (List.length before) after @@ fun vafter ->
+                bind_list "before" before @@ fun vbefore ->
+                bind_list "after" after @@ fun vafter ->
                 dps ~tail ~dst ~delayed:(fun t ->
-                  delayed (k flag (plug_args (vars vbefore) t (vars vafter))))
+                  delayed (k flag (plug_args vbefore t vafter)))
           );
         }
 
