@@ -489,7 +489,7 @@ let declare_binding ctx (var, def) =
   { candidates = Ident.Map.add var cand ctx.candidates }
 
 let rec choice ctx t =
-  let rec choice ctx t =
+  let rec choice ctx ~tail t =
     begin[@warning "-8"]
       (*FIXME: allows non-exhaustive pattern matching;
         use an overkill functor-based solution instead? *)
@@ -502,31 +502,31 @@ let rec choice ctx t =
       (* [choice_prim] handles most primitives, but the important case of construction
          [Lprim(Pmakeblock(...), ...)] is handled by [choice_makeblock] *)
       | Lprim (prim, primargs, loc) ->
-          choice_prim ctx prim primargs loc
+          choice_prim ctx ~tail prim primargs loc
 
       (* [choice_apply] handles applications, in particular tail-calls which
          generate Set choices at the leaves *)
       | Lapply apply ->
-          choice_apply ctx apply
+          choice_apply ctx ~tail apply
       (* other cases use the [lift] helper that takes the sub-terms in tail
          position and the context around them, and generates a choice for
          the whole term from choices for the tail subterms. *)
       | Lsequence (l1, l2) ->
           let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx l2 in
+          let+ l2 = choice ctx ~tail l2 in
           Lsequence (l1, l2)
       | Lifthenelse (l1, l2, l3) ->
           let l1 = traverse ctx l1 in
-          let+ (l2, l3) = choice_pair ctx (l2, l3) in
+          let+ (l2, l3) = choice_pair ctx ~tail (l2, l3) in
           Lifthenelse (l1, l2, l3)
       | Llet (lk, vk, var, def, body) ->
           (* non-recursive bindings are not specialized *)
           let def = traverse ctx def in
-          let+ body = choice ctx body in
+          let+ body = choice ctx ~tail body in
           Llet (lk, vk, var, def, body)
       | Lletrec (bindings, body) ->
           let ctx, bindings = traverse_letrec ctx bindings in
-          let+ body = choice ctx body in
+          let+ body = choice ctx ~tail body in
           Lletrec(bindings, body)
       | Lswitch (l1, sw, loc) ->
           (* decompose *)
@@ -534,9 +534,9 @@ let rec choice ctx t =
           let blocks_lhs, blocks_rhs = List.split sw.sw_blocks in
           (* transform *)
           let l1 = traverse ctx l1 in
-          let+ consts_rhs = choice_list ctx consts_rhs
-          and+ blocks_rhs = choice_list ctx blocks_rhs
-          and+ sw_failaction = choice_option ctx sw.sw_failaction in
+          let+ consts_rhs = choice_list ctx ~tail consts_rhs
+          and+ blocks_rhs = choice_list ctx ~tail blocks_rhs
+          and+ sw_failaction = choice_option ctx ~tail sw.sw_failaction in
           (* rebuild *)
           let sw_consts = List.combine consts_lhs consts_rhs in
           let sw_blocks = List.combine blocks_lhs blocks_rhs in
@@ -547,8 +547,8 @@ let rec choice ctx t =
           let cases_lhs, cases_rhs = List.split cases in
           (* transform *)
           let l1 = traverse ctx l1 in
-          let+ cases_rhs = choice_list ctx cases_rhs
-          and+ fail = choice_option ctx fail in
+          let+ cases_rhs = choice_list ctx ~tail cases_rhs
+          and+ fail = choice_option ctx ~tail fail in
           (* rebuild *)
           let cases = List.combine cases_lhs cases_rhs in
           Lstringswitch (l1, cases, fail, loc)
@@ -561,23 +561,23 @@ let rec choice ctx t =
              we need to remove the exception handler),
              so it is not transformed here *)
           let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx l2 in
+          let+ l2 = choice ctx ~tail l2 in
           Ltrywith (l1, id, l2)
       | Lstaticcatch (l1, ids, l2) ->
           (* In [static-catch l1 with ids -> l2],
              the term [l1] is in fact in tail-position *)
-          let+ l1 = choice ctx l1
-          and+ l2 = choice ctx l2 in
+          let+ l1 = choice ctx ~tail l1
+          and+ l2 = choice ctx ~tail l2 in
           Lstaticcatch (l1, ids, l2)
       | Levent (lam, lev) ->
-          let+ lam = choice ctx lam in
+          let+ lam = choice ctx ~tail lam in
           Levent (lam, lev)
       | Lifused (x, lam) ->
-          let+ lam = choice ctx lam in
+          let+ lam = choice ctx ~tail lam in
           Lifused (x, lam)
     end
 
-  and choice_apply ctx apply =
+  and choice_apply ctx ~tail apply =
     let exception No_trmc in
     try
       match apply.ap_func with
@@ -594,11 +594,10 @@ let rec choice ctx t =
           let candidate =
             try Ident.Map.find f ctx.candidates
             with Not_found ->
-              (* TODO warn: tail-callness of the call is broken in
-                 the destination-passing-style version; either the function [f]
-                 should be marked as trmc-specializable at the callsite,
-                 or the user should add [@tailcall false] to clarify
-                 that they are aware of this limitation. *)
+              if tail then
+                Location.prerr_warning
+                  (Debuginfo.Scoped_location.to_location apply.ap_loc)
+                  Warnings.Trmc_breaks_tailcall;
               raise No_trmc
           in
           Choice.Set {
@@ -617,10 +616,10 @@ let rec choice ctx t =
       | _nontail -> raise No_trmc
     with No_trmc -> Choice.Return (Lapply apply)
 
-  and choice_makeblock ctx (tag, flag, shape) blockargs loc =
+  and choice_makeblock ctx ~tail:_ (tag, flag, shape) blockargs loc =
     let k new_flag new_block_args =
       Lprim (Pmakeblock (tag, new_flag, shape), new_block_args, loc) in
-    let choices = List.map (choice ctx) blockargs in
+    let choices = List.map (choice ~tail:false ctx) blockargs in
     match Choice.find_nonambiguous_settable choices with
     | Choice.Ambiguous subterms ->
         let subterms = List.map (fun c -> c.Choice.direct ()) subterms in
@@ -710,26 +709,26 @@ let rec choice ctx t =
           );
         }
 
-  and choice_prim ctx prim primargs loc =
+  and choice_prim ctx ~tail prim primargs loc =
     begin [@warning "-8"] (* see choice *)
       match prim with
       (* The important case is the construction case *)
       | Pmakeblock (tag, flag, shape) ->
-          choice_makeblock ctx (tag, flag, shape) primargs loc
+          choice_makeblock ctx ~tail (tag, flag, shape) primargs loc
 
       (* Some primitives have arguments in tail-position *)
       | (Pidentity | Popaque) as idop ->
           let l1 = match primargs with
             |  [l1] -> l1
             | _ -> invalid_arg "choice_prim" in
-          let+ l1 = choice ctx l1 in
+          let+ l1 = choice ctx ~tail l1 in
           Lprim (idop, [l1], loc)
       | (Psequand | Psequor) as shortcutop ->
           let l1, l2 = match primargs with
             |  [l1; l2] -> l1, l2
             | _ -> invalid_arg "choice_prim" in
           let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx l2 in
+          let+ l2 = choice ctx ~tail l2 in
           Lprim (shortcutop, [l1; l2], loc)
 
       (* in common cases we just Return *)
@@ -785,12 +784,12 @@ let rec choice ctx t =
           Choice.Return (Lprim (prim, primargs, loc))
     end
 
-  and choice_list ctx terms =
-    Choice.list (List.map (choice ctx) terms)
-  and choice_pair ctx (t1, t2) =
-    Choice.pair (choice ctx t1, choice ctx t2)
-  and choice_option ctx t =
-    Choice.option (Option.map (choice ctx) t)
+  and choice_list ctx ~tail terms =
+    Choice.list (List.map (choice ctx ~tail) terms)
+  and choice_pair ctx ~tail (t1, t2) =
+    Choice.pair (choice ctx ~tail t1, choice ctx ~tail t2)
+  and choice_option ctx ~tail t =
+    Choice.option (Option.map (choice ctx ~tail) t)
 
   in choice ctx t
 
@@ -811,7 +810,7 @@ and traverse_binding ctx (var, def) =
   | None -> [(var, traverse ctx def)]
   | Some lfun ->
   let cand = Ident.Map.find var ctx.candidates in
-  let cand_choice = choice ctx lfun.body in
+  let cand_choice = choice ctx ~tail:true lfun.body in
   begin match cand_choice with
   | Choice.Set _ -> ()
   | Choice.Return _ ->

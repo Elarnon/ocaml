@@ -94,7 +94,7 @@ type t =
   | Unused_functor_parameter of string      (* 67 *)
   | Invalid_trmc_attribute                  (* 68 *)
   | Unused_trmc_attribute                   (* 69 *)
-  | Potential_trmc_call                     (* 70 *)
+  | Trmc_breaks_tailcall                    (* 70 *)
 ;;
 
 (* If you remove a warning, leave a hole in the numbering.  NEVER change
@@ -175,7 +175,7 @@ let number = function
   | Unused_functor_parameter _ -> 67
   | Invalid_trmc_attribute -> 68
   | Unused_trmc_attribute -> 69
-  | Potential_trmc_call -> 70
+  | Trmc_breaks_tailcall -> 70
 ;;
 
 let last_warning_number = 70
@@ -399,7 +399,7 @@ let parse_options errflag s =
   current := {(!current) with error; active}
 
 (* If you change these, don't forget to change them in man/ocamlc.m *)
-let defaults_w = "+a-4-6-7-9-27-29-30-32..42-44-45-48-50-60-66-67-70";;
+let defaults_w = "+a-4-6-7-9-27-29-30-32..42-44-45-48-50-60-66-67";;
 let defaults_warn_error = "-a+31";;
 
 let () = parse_options false defaults_w;;
@@ -639,11 +639,16 @@ let message = function
          Hint: Did you mean 'type %s = unit'?" name
   | Unused_functor_parameter s -> "unused functor parameter " ^ s ^ "."
   | Invalid_trmc_attribute ->
-      "trmc attribute is only applicable on recursive function bindings"
+      "Trmc attribute is only applicable on recursive function bindings."
   | Unused_trmc_attribute ->
-      "this function is marked trmc but is never applied in trmc position"
-  | Potential_trmc_call ->
-      "this function is applied in trmc position"
+      "This function is marked for TRMC but is never applied in TRMC position."
+  | Trmc_breaks_tailcall ->
+      "This call is in tail-position in a trmc function,\n\
+       but the function called is not itself specialized for TRMC,\n\
+       so the call will not be in tail position in the transformed version.\n\
+       Please either mark the called function with the [@trmc] attribute,\n\
+       or mark this call with the [@tailcall false] attribute to make its\n\
+       non-tailness explicit."
 ;;
 
 let nerrors = ref 0;;
