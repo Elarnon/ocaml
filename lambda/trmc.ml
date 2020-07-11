@@ -1,5 +1,10 @@
 open Lambda
 
+type error =
+  |  Ambiguous_constructor_arguments of lambda list
+
+exception Error of Location.t * error
+
 (** TRMC (tail-recursion-modulo-cons) is a code transformation that
     rewrites transformed functions in destination-passing-style, in
     such a way that certain calls that were not in tail position in the
@@ -327,6 +332,7 @@ module Choice = struct
     dps: 'a Dps.t;
     direct: unit -> 'a;
     benefits_from_dps: bool;
+    explicit_tailcall_request: bool;
   }
   (**
      A [settable] record represents code that may be written in destination-passing style
@@ -352,35 +358,19 @@ module Choice = struct
      to TRMC versions than the [direct] version. When [benefits_from_dps]
      is false, there is no difference in number of TRMC sub-calls --
      see the {!choice_makeblock} case.
-  *)
 
-  (** Finds the first [settable] element in a list [choices];
-      - if it exists, it gives a record
-        [{rev_returns; settable; tail_choices}] such that
-        [choices =
-          List.rev_append
-            (List.map Return rev_returns)
-            (Settable settable :: tail_choices)]
-      - if there is no settable element, it gives a list [returns]
-        such that [choices = List.map Return returns]
+     The [explicit_tailcall_request] boolean is true when the user
+     used a [@tailcall] annotation on the optimizable callsite.
+     When one of several calls could be optimized, we expect that
+     exactly one of them will be annotated by the user, or fail
+     because the situation is ambiguous.
   *)
-  type 'a settable_zipper = {
-    rev_returns : 'a list;
-    settable : 'a settable;
-    tail_choices: 'a t list
-  }
-
-  let find_settable : 'a t list -> ('a settable_zipper, 'a list) result =
-    let rec find rev_returns = function
-      | [] -> Error (List.rev rev_returns)
-      | Return r :: rest -> find (r :: rev_returns) rest
-      | Set settable :: tail_choices -> Ok { rev_returns; settable; tail_choices }
-    in find []
 
   let map_settable f s = {
-    benefits_from_dps = s.benefits_from_dps;
     direct = (fun () -> f (s.direct ()));
     dps = Dps.map f s.dps;
+    benefits_from_dps = s.benefits_from_dps;
+    explicit_tailcall_request = s.explicit_tailcall_request;
   }
 
   let map f = function
@@ -396,9 +386,12 @@ module Choice = struct
         Set (map_settable (fun v2 -> (v1, v2)) s2)
     | Set s1, Set s2 ->
         Set {
-          benefits_from_dps = s1.benefits_from_dps || s2.benefits_from_dps;
           direct = (fun () -> s1.direct (), s2.direct ());
           dps = Dps.pair s1.dps s2.dps;
+          benefits_from_dps =
+            s1.benefits_from_dps || s2.benefits_from_dps;
+          explicit_tailcall_request =
+            s1.explicit_tailcall_request || s2.explicit_tailcall_request;
         }
 
   let (let+) c f = map f c
@@ -426,6 +419,47 @@ module Choice = struct
         (fun ~tail:_ ~dst -> assign_to_dst loc dst t)
     | Set settable ->
         Dps.run settable.dps
+
+  (** The [find_*] machinery is used to locate a single settable subterm
+      to optimize among a list of subterms. If there are several possible choices,
+      we require that exactly one of them be annotated with [@tailcall], or
+      we report an ambiguity. *)
+  type 'a find_settable_result =
+    | All_returns of 'a list
+    | Nonambiguous of 'a settable_zipper
+    | Ambiguous of 'a settable list
+  and 'a settable_zipper =
+    { rev_before : 'a list; settable : 'a settable; after : 'a list }
+
+  let find_nonambiguous_settable choices =
+    let is_explicit s = s.explicit_tailcall_request in
+    let nonambiguous ~explicit choices =
+      (* here is how we will compute the result once we know that there
+         is an unambiguously-determined settable, and whether
+         an explicit request was necessary to disambiguate *)
+      let rec split rev_before : 'a t list -> _ = function
+        | [] -> assert false (* we know there is at least one settable *)
+        | Set s :: rest when (not explicit || is_explicit s) ->
+            { rev_before; settable = s; after = List.map direct rest }
+        | c :: rest -> split (direct c :: rev_before) rest
+      in split [] choices
+    in
+    let settable_subterms =
+      List.filter_map (function Return _ -> None | Set s -> Some s) choices
+    in
+    match settable_subterms with
+    | [] ->
+        All_returns (List.map direct choices)
+    | [ _one ] ->
+        Nonambiguous (nonambiguous ~explicit:false choices)
+    | several_subterms ->
+        let explicit_subterms = List.filter is_explicit several_subterms in
+        begin match explicit_subterms with
+        | [] -> Ambiguous several_subterms
+        | [ _one ] ->
+            Nonambiguous (nonambiguous ~explicit:true choices)
+        | several_explicit_subterms -> Ambiguous several_explicit_subterms
+        end
 end
 
 let (let+), (and+) = Choice.((let+), (and+))
@@ -548,7 +582,15 @@ let rec choice ctx t =
     try
       match apply.ap_func with
       | Lvar f ->
-          (* TODO: if [@tailcall false] then raise No_trmc; *)
+          let explicit_tailcall_request =
+            match apply.ap_tailcall with
+            | Should_be_tailcall -> true
+            | Default_tailcall -> false
+            | Should_not_be_tailcall ->
+                (* [@tailcall false] disables trmc optimization
+                   on this tailcall *)
+                raise No_trmc
+          in
           let candidate =
             try Ident.Map.find f ctx.candidates
             with Not_found ->
@@ -561,6 +603,7 @@ let rec choice ctx t =
           in
           Choice.Set {
             benefits_from_dps = true;
+            explicit_tailcall_request;
             dps = Dynamic (fun ~tail ~dst ->
               let f_dps = candidate.dps_id in
               Lapply { apply with
@@ -578,20 +621,17 @@ let rec choice ctx t =
     let k new_flag new_block_args =
       Lprim (Pmakeblock (tag, new_flag, shape), new_block_args, loc) in
     let choices = List.map (choice ctx) blockargs in
-    match Choice.find_settable choices with
-    | Error all_returns ->
+    match Choice.find_nonambiguous_settable choices with
+    | Choice.Ambiguous subterms ->
+        let subterms = List.map (fun c -> c.Choice.direct ()) subterms in
+        raise (Error (Debuginfo.Scoped_location.to_location loc,
+                      Ambiguous_constructor_arguments subterms))
+    | Choice.All_returns all_returns ->
         let all_returns = traverse_list ctx all_returns in
         Choice.Return (k flag all_returns)
-    | Ok { rev_returns; settable; tail_choices } ->
-        begin
-          (* fail if this settable position is not unique *)
-          match Choice.find_settable tail_choices with
-          | Error _all_returns -> ()
-          | Ok _another_settable ->
-              failwith "TODO proper error/warning: ambiguous settable position"
-        end;
-        let before = traverse_list ctx (List.rev rev_returns) in
-        let after = traverse_list ctx (List.map Choice.direct tail_choices) in
+    | Choice.Nonambiguous { Choice.rev_before; settable; after } ->
+        let before = traverse_list ctx (List.rev rev_before) in
+        let after = traverse_list ctx after in
         let plug_args before t after =
           List.append before @@ t :: after in
         let k_with_placeholder =
@@ -606,6 +646,8 @@ let rec choice ctx t =
         in
         let block_dst block_var = { var = block_var; offset = placeholder_pos_lam } in
         Choice.Set {
+          explicit_tailcall_request =
+            settable.explicit_tailcall_request;
           benefits_from_dps =
             (* Whether or not the caller provides a destination,
                we can always provide a destination to our settable
@@ -791,3 +833,21 @@ and traverse_list ctx terms =
 let rewrite t =
   let ctx = { candidates = Ident.Map.empty } in
   traverse ctx t
+
+let report_error ppf = function
+  | Ambiguous_constructor_arguments subterms ->
+      ignore subterms; (* TODO: find locations for each subterm *)
+      Format.pp_print_text ppf
+        "[@trmc]: this constructor application may be trmc-transformed \
+         in several different ways. Please disambiguate by adding \
+         an explicit [@tailcall] attribute to the call that should \
+         be made tail-recursive, or a [@tailcall false] attribute \
+         on calls that should not be transformed."
+let () =
+  Location.register_error_of_exn
+    (function
+      | Error (loc, err) ->
+          Some (Location.error_of_printer ~loc report_error err)
+      | _ ->
+        None
+    )
