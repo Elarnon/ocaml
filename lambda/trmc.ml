@@ -465,9 +465,9 @@ end
 let (let+), (and+) = Choice.((let+), (and+))
 
 type context = {
-  candidates: candidate Ident.Map.t;
+  specialized: specialized Ident.Map.t;
 }
-and candidate = {
+and specialized = {
   arity: int;
   dps_id: Ident.t;
 }
@@ -475,18 +475,18 @@ and candidate = {
 let trmc_placeholder = Lconst (Const_base (Const_int 0))
 (* TODO consider using a more magical constant like 42, for debugging? *)
 
-let find_candidate = function
+let find_specialized = function
   | Lfunction lfun when lfun.attr.trmc_candidate -> Some lfun
   | _ -> None
 
 let declare_binding ctx (var, def) =
-  match find_candidate def with
+  match find_specialized def with
   | None -> ctx
   | Some lfun ->
   let arity = List.length lfun.params in
   let dps_id = Ident.create_local (Ident.name var ^ "_trmc") in
   let cand = { arity; dps_id } in
-  { candidates = Ident.Map.add var cand ctx.candidates }
+  { specialized = Ident.Map.add var cand ctx.specialized }
 
 let rec choice ctx t =
   let rec choice ctx ~tail t =
@@ -591,8 +591,8 @@ let rec choice ctx t =
                    on this tailcall *)
                 raise No_trmc
           in
-          let candidate =
-            try Ident.Map.find f ctx.candidates
+          let specialized =
+            try Ident.Map.find f ctx.specialized
             with Not_found ->
               if tail then
                 Location.prerr_warning
@@ -604,7 +604,7 @@ let rec choice ctx t =
             benefits_from_dps = true;
             explicit_tailcall_request;
             dps = Dynamic (fun ~tail ~dst ->
-              let f_dps = candidate.dps_id in
+              let f_dps = specialized.dps_id in
               Lapply { apply with
                        ap_func = Lvar f_dps;
                        ap_args = add_dst_args dst apply.ap_args;
@@ -806,10 +806,10 @@ and traverse_letrec ctx bindings =
   ctx, bindings
 
 and traverse_binding ctx (var, def) =
-  match find_candidate def with
+  match find_specialized def with
   | None -> [(var, traverse ctx def)]
   | Some lfun ->
-  let cand = Ident.Map.find var ctx.candidates in
+  let cand = Ident.Map.find var ctx.specialized in
   let cand_choice = choice ctx ~tail:true lfun.body in
   begin match cand_choice with
   | Choice.Set _ -> ()
@@ -837,7 +837,7 @@ and traverse_list ctx terms =
   List.map (traverse ctx) terms
 
 let rewrite t =
-  let ctx = { candidates = Ident.Map.empty } in
+  let ctx = { specialized = Ident.Map.empty } in
   traverse ctx t
 
 let report_error ppf = function
