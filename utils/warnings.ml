@@ -92,9 +92,9 @@ type t =
   | Redefining_unit of string               (* 65 *)
   | Unused_open_bang of string              (* 66 *)
   | Unused_functor_parameter of string      (* 67 *)
-  | Invalid_trmc_attribute                  (* 68 *)
-  | Unused_trmc_attribute                   (* 69 *)
-  | Trmc_breaks_tailcall                    (* 70 *)
+  | Invalid_TRMC_attribute                  (* 68 *)
+  | Unused_TRMC_attribute                   (* 69 *)
+  | TRMC_breaks_tailcall                    (* 70 *)
 ;;
 
 (* If you remove a warning, leave a hole in the numbering.  NEVER change
@@ -173,9 +173,9 @@ let number = function
   | Redefining_unit _ -> 65
   | Unused_open_bang _ -> 66
   | Unused_functor_parameter _ -> 67
-  | Invalid_trmc_attribute -> 68
-  | Unused_trmc_attribute -> 69
-  | Trmc_breaks_tailcall -> 70
+  | Invalid_TRMC_attribute -> 68
+  | Unused_TRMC_attribute -> 69
+  | TRMC_breaks_tailcall -> 70
 ;;
 
 let last_warning_number = 70
@@ -638,17 +638,20 @@ let message = function
          which shadows the existing one.\n\
          Hint: Did you mean 'type %s = unit'?" name
   | Unused_functor_parameter s -> "unused functor parameter " ^ s ^ "."
-  | Invalid_trmc_attribute ->
-      "Trmc attribute is only applicable on recursive function bindings."
-  | Unused_trmc_attribute ->
-      "This function is marked for TRMC but is never applied in TRMC position."
-  | Trmc_breaks_tailcall ->
-      "This call is in tail-position in a trmc function,\n\
-       but the function called is not itself specialized for TRMC,\n\
-       so the call will not be in tail position in the transformed version.\n\
-       Please either mark the called function with the [@trmc] attribute,\n\
-       or mark this call with the [@tailcall false] attribute to make its\n\
-       non-tailness explicit."
+  | Invalid_TRMC_attribute ->
+      "[@tailrec_mod_constr] attribute is only applicable on recursive \
+       function bindings."
+  | Unused_TRMC_attribute ->
+      "This function is marked [@tailrec_mod_constr] but is never \
+       applied in TRMC position."
+  | TRMC_breaks_tailcall ->
+      "This call is in tail-position in a TRMC function, but\n\
+       the function called is not itself specialized for TRMC,\n\
+       so the call will not be in tail position in the transformed\n\
+       version.\n\
+       Please either mark the called function with the\n\
+       [@tailrec_mod_constr] attribute, or mark this call with the\n\
+       [@tailcall false] attribute to make its non-tailness explicit."
 ;;
 
 let nerrors = ref 0;;
@@ -794,9 +797,9 @@ let descriptions =
    65, "Type declaration defining a new '()' constructor.";
    66, "Unused open! statement.";
    67, "Unused functor parameter.";
-   68, "Warning on non-recursive functions with @trmc attribute";
-   69, "Unused @trmc attribute";
-   70, "Warning on functions which would benefit from a @trmc attribute";
+   68, "Warning on non-recursive functions with @tailrec_mod_constr attribute";
+   69, "Unused @tailrec_mod_constr attribute";
+   70, "Warning on functions which would benefit from a @tailrec_mod_constr attribute";
   ]
 ;;
 

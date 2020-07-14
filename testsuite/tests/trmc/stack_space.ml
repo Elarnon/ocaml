@@ -7,13 +7,13 @@
 let large = 1000
 
 let init n f =
-  let[@trmc] rec init_aux i n f =
+  let[@tailrec_mod_constr] rec init_aux i n f =
     if i = n then []
     else f i :: init_aux (i + 1) n f
   in init_aux 0 n f
 
 module ListMap = struct
-  let[@trmc] rec map f = function
+  let[@tailrec_mod_constr] rec map f = function
     | [] -> []
     | x :: xs ->
         (* Note: trmc guarantees that 'map f xs' is evaluated last *)
@@ -29,7 +29,7 @@ module TreeMap = struct
     | Leaf of 'a
     | Node of 'a tree * 'a tree
 
-  let[@trmc] rec map f = function
+  let[@tailrec_mod_constr] rec map f = function
     | Leaf v -> Leaf (f v)
     | Node (left, right) ->
         Node (map f left, (map [@tailcall]) f right)

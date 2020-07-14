@@ -39,7 +39,7 @@ let is_local_attribute = function
   | _ -> false
 
 let is_trmc_attribute = function
-  | {txt=("trmc"|"ocaml.trmc")} -> true
+  | {txt=("tailrec_mod_constr"|"ocaml.tailrec_mod_constr")} -> true
   | _ -> false
 
 let find_attribute p attributes =
@@ -255,12 +255,12 @@ let add_trmc_attribute expr loc attributes =
     | Lfunction funct ->
         if funct.attr.trmc_candidate then
             Location.prerr_warning loc
-              (Warnings.Duplicated_attribute "trmc");
+              (Warnings.Duplicated_attribute "tailrec_mod_constr");
         let attr = { funct.attr with trmc_candidate = true } in
         Lfunction { funct with attr }
     | expr ->
         Location.prerr_warning loc
-          (Warnings.Misplaced_attribute "trmc");
+          (Warnings.Misplaced_attribute "tailrec_mod_constr");
         expr
   else
     expr

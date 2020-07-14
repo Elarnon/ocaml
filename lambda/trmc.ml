@@ -62,7 +62,7 @@ exception Error of Location.t * error
     Note: in this implementation, the scope of the TRMC transformation
     is a single set of mutually-recursive-declarations; TRMC applies
     to declarations of the form
-      [let[@trmc] rec f1 = t1 and .. and fn = tn in u]
+      [let[@tailrec_mod_constr] rec f1 = t1 and .. and fn = tn in u]
     and only the callsites of [f1..fn] within [t1..tn] will get
     considered for destination-passing-style transformations; callsites in [u]
     are not analyzed, and will always call the direct version (which may
@@ -578,7 +578,7 @@ let rec choice ctx t =
     end
 
   and choice_apply ctx ~tail apply =
-    let exception No_trmc in
+    let exception No_TRMC in
     try
       match apply.ap_func with
       | Lvar f ->
@@ -587,9 +587,9 @@ let rec choice ctx t =
             | Should_be_tailcall -> true
             | Default_tailcall -> false
             | Should_not_be_tailcall ->
-                (* [@tailcall false] disables trmc optimization
+                (* [@tailcall false] disables TRMC optimization
                    on this tailcall *)
-                raise No_trmc
+                raise No_TRMC
           in
           let specialized =
             try Ident.Map.find f ctx.specialized
@@ -597,8 +597,8 @@ let rec choice ctx t =
               if tail then
                 Location.prerr_warning
                   (Debuginfo.Scoped_location.to_location apply.ap_loc)
-                  Warnings.Trmc_breaks_tailcall;
-              raise No_trmc
+                  Warnings.TRMC_breaks_tailcall;
+              raise No_TRMC
           in
           Choice.Set {
             benefits_from_dps = true;
@@ -613,8 +613,8 @@ let rec choice ctx t =
                      });
             direct = (fun () -> Lapply apply);
           }
-      | _nontail -> raise No_trmc
-    with No_trmc -> Choice.Return (Lapply apply)
+      | _nontail -> raise No_TRMC
+    with No_TRMC -> Choice.Return (Lapply apply)
 
   and choice_makeblock ctx ~tail:_ (tag, flag, shape) blockargs loc =
     let k new_flag new_block_args =
@@ -816,7 +816,7 @@ and traverse_binding ctx (var, def) =
   | Choice.Return _ ->
       Location.prerr_warning
         (Debuginfo.Scoped_location.to_location lfun.loc)
-        Warnings.Unused_trmc_attribute;
+        Warnings.Unused_TRMC_attribute;
   end;
   let direct =
     Lfunction { lfun with body = Choice.direct cand_choice } in
@@ -844,11 +844,11 @@ let report_error ppf = function
   | Ambiguous_constructor_arguments subterms ->
       ignore subterms; (* TODO: find locations for each subterm *)
       Format.pp_print_text ppf
-        "[@trmc]: this constructor application may be trmc-transformed \
-         in several different ways. Please disambiguate by adding \
-         an explicit [@tailcall] attribute to the call that should \
-         be made tail-recursive, or a [@tailcall false] attribute \
-         on calls that should not be transformed."
+        "[@tailrec_mod_constr]: this constructor application may be \
+         TRMC-transformed in several different ways. Please \
+         disambiguate by adding an explicit [@tailcall] attribute to \
+         the call that should be made tail-recursive, or a [@tailcall \
+         false] attribute on calls that should not be transformed."
 let () =
   Location.register_error_of_exn
     (function
