@@ -70,7 +70,7 @@ exception Error of Location.t * error
     In particular, there is no propagation of information across modules.
 *)
 
-type 'offset destination = { var: Ident.t; offset: 'offset; }
+type 'offset destination = { var: Ident.t; offset: 'offset; loc : Debuginfo.Scoped_location.t }
 and offset = lambda
 (** In the OCaml value model, interior pointers are not allowed.  To
     represent the "placeholder to mutate" in DPS code, we thus use a pair
@@ -90,9 +90,76 @@ let add_dst_params ({var; offset} : Ident.t destination) params =
 let add_dst_args ({var; offset} : offset destination) args =
   Lvar var :: offset :: args
 
-let assign_to_dst loc {var; offset} lam =
+let assign_to_dst {var; offset; loc} lam =
   Lprim(Psetfield_computed(Pointer, Heap_initialization),
         [Lvar var; offset; lam], loc)
+
+(** The type [Constr.t] represents a reified constructor with a single hole, which can
+    be either directly applied to a [lambda] term, or be used to create
+    a fresh [lambda destination] with a placeholder.
+ *)
+module Constr = struct
+  type t = {
+    tag : int;
+    flag: Asttypes.mutable_flag;
+    shape : block_shape;
+    before: lambda list;
+    after: lambda list;
+    loc : Debuginfo.Scoped_location.t;
+  }
+
+  let apply ?flag con t =
+    let flag = match flag with None -> con.flag | Some flag -> flag in
+    let block_args = List.append con.before @@ t :: con.after in
+    Lprim (Pmakeblock (con.tag, flag, con.shape), block_args, con.loc)
+
+  let trmc_placeholder = Lconst (Const_base (Const_int 0))
+  (* TODO consider using a more magical constant like 42, for debugging? *)
+
+  let with_placeholder con (body : lambda destination -> lambda -> lambda) : lambda =
+    let k_with_placeholder = apply ~flag:Mutable con trmc_placeholder in
+    let placeholder_pos = List.length con.before in
+    let placeholder_pos_lam = Lconst (Const_base (Const_int placeholder_pos)) in
+    let block_var = Ident.create_local "block" in
+    Llet (Strict, Pgenval, block_var, k_with_placeholder,
+          body { var = block_var; offset = placeholder_pos_lam ; loc = con.loc } (Lvar block_var))
+
+  (** We want to delay the application of the constructor to a later time.
+      This may move the constructor application below some effectful
+      expressions (if we move into a context of the form [foo;
+      bar_with_trmc_inside] for example), and we want to preserve the
+      evaluation order of the other arguments of the constructor.  So we bind
+      them before proceeding, unless they are obviously side-effect free. *)
+  let delay_impure : t -> (t -> lambda) -> lambda =
+    let bind_list name lambdas k =
+      let can_be_delayed =
+        (* Note that the delayed subterms will be used
+           exactly once in the linear-static subterm. So
+           we are happy to delay constants, which we would
+           not want to duplicate. *)
+        function
+        | Lvar _ | Lconst _ -> true
+        | _ -> false in
+      let bindings, args =
+        lambdas
+        |> List.mapi (fun i lam ->
+            if can_be_delayed lam then (None, lam)
+            else begin
+              let v = Ident.create_local (Printf.sprintf "arg_%s_%d" name i) in
+              (Some (v, lam), Lvar v)
+            end)
+        |> List.split in
+      let body = k args in
+      List.fold_right (fun binding body ->
+          match binding with
+          | None -> body
+          | Some (v, lam) -> Llet(Strict, Pgenval, v, lam, body)
+        ) bindings body in
+    fun con body ->
+    bind_list "before" con.before @@ fun vbefore ->
+    bind_list "after" con.after @@ fun vafter ->
+    body { con with before = vbefore; after = vafter }
+end
 
 (** The type ['a Dps.t] (destination-passing-style) represents a
     version of ['a] that is parametrized over a [lambda destination].
@@ -100,16 +167,13 @@ let assign_to_dst loc {var; offset} lam =
     a [(lambda * lambda) Dps.t] represents two subterms parametrized
     over the same destination. *)
 module Dps = struct
-  type 'a dynamic =
-    tail:bool -> dst:lambda destination -> 'a
-  (** A term parametrized over a destination. The [tail] argument is
+  type 'a t =
+    tail:bool -> dst:lambda destination -> delayed:Constr.t list -> 'a
+  (* A term parametrized over a destination. The [tail] argument is
       passed by the caller to indicate whether the term will be placed
       in tail-position -- this allows to generate correct @tailcall
       annotations. *)
-
-  type 'a linear_static =
-    tail:bool -> dst:lambda destination -> delayed:(lambda -> lambda) -> 'a
-  (** Short verion:
+  (* Short verion:
 
       To optimize nested constructors, we keep track in the choice
       structure of which DPS terms are in the "linear static"
@@ -260,31 +324,128 @@ module Dps = struct
         x :: (let v = e in y :: trmc call)
       ]}
   *)
+  (** A term parameterized over a destination.  The [tail] argument
+      is passed by the caller to indicate whether the term will be placed
+      in tail-position -- this allows to generate correct @tailcall
+      annotations.
 
-  type 'a t =
-    | Dynamic of 'a dynamic
-    | Linear_static of 'a linear_static
+      Moreover, we want to optimize nested constructors, for example:
 
-  let coerce (dps : 'a linear_static) : 'a dynamic =
-    fun ~tail ~dst ->
-      dps ~tail ~dst ~delayed:(fun t -> t)
+      {[
+        (x () :: y () :: trmc call)
+      ]}
 
-  let run : 'a t -> 'a dynamic = function
-    | Dynamic dps -> dps
-    | Linear_static dps -> coerce dps
+      which would naively generate (in a DPS context parametrized
+      over a location dst.i):
 
-  let map f = function
-    | Dynamic dps ->
-        Dynamic (fun ~tail ~dst -> f (dps ~tail ~dst))
-    | Linear_static dps ->
-        Linear_static (fun ~tail ~dst ~delayed -> f (dps ~tail ~dst ~delayed))
+      {[
+        let dstx = x () :: Placeholder in
+        dst.i <- dstx;
+        let dsty = y () :: Placeholder in
+        dstx.1 <- dsty;
+        trmc dsty.1 call
+      ]}
 
-  (* Pairing two DPS terms gives a result that
-     uses its destination at least twice, so it is
-     never linear, always Dynamic *)
+      when we would rather hope for
+
+      {[
+        let vx = x () in
+        let dsty = y () :: Placeholder in
+        dst.i <- vx :: dsty;
+        trmc dsty.1 call
+      ]}
+
+      The idea is that the unoptimized version first creates a
+      destination site [dstx], which is then used by the following
+      code.  If we keep track of the current destination:
+
+      {[
+        (* Destination is [dst.i] *)
+        let dstx = x () :: Placeholder in
+        dst.i (* Destination *) <- dstx;
+        (* Destination is [dstx.1] *)
+        let dsty = y () :: Placeholder in
+        dstx.1 (* Destination *) <- dsty;
+        (* Destination is [dsty.1] *)
+        trmc dsty.1 call
+      ]}
+
+      Instead of binding the whole newly-created destination, we can
+      simply let-bind the non-placeholder arguments (in order to 
+      preserve execution order), and keep track of a list of blocks to
+      be created along with the current destination.  Instead of seeing
+      a DPS fragment as writing to a destination, we see it as a term
+      with shape [dst.i <- C .] where [C .] is a linear context consisting
+      only of constructor applications.
+
+      {[
+        (* Destination is [dst.i <- C .] *)
+        let vx = x () in
+        (* Destination is [dst.i <- C (vx :: .)] *)
+        let vy = y () in
+        (* Destination is [dst.i <- C (vx :: vy :: .)] *)
+        (* Making a call: reify the destination *)
+        let dsty = vy :: Placeholder in
+        dst.i <- vx :: dsty;
+        trmc dsty.1 call
+      ]}
+
+      The [delayed] argument represents the context [C] as a list of
+      reified constructors, to allow both to build the final holey
+      block ([vy :: Placeholder]) at the recursive call site, and
+      the delayed constructor applications ([vx :: dsty]).
+
+      In practice, it is not desirable to perform this simplification
+      when there are multiple TRMC calls (e.g. in different branches
+      of an [if] block), because it would cause duplication of the
+      nested constructor applications.  The [Choice] module keeps track
+      of this information.
+*)
+
+  let write_to_dst dst delayed t =
+    assign_to_dst dst @@
+    List.fold_left (fun t con -> Constr.apply con t) t delayed
+
+  let return (v : lambda) : lambda t =
+    fun ~tail:_ ~dst ~delayed ->
+      write_to_dst dst delayed v
+  (** Create a new destination-passing-style term which is simply
+      setting the destination with the given [v], hence "returning"
+      it.
+   *)
+
+  let empty (v : 'a) : 'a t = fun ~tail:_ ~dst:_ ~delayed:_ -> v
+  (** Create an empty container for destination-passing-style lambdas.
+    
+      This is meant to be used for container types which do not contain
+      any lambda values, such as [None] or [[]].
+   *)
+
+  let delay_impure (dps : 'a t) : 'a t =
+    fun ~tail ~dst ~delayed ->
+      List.fold_left (fun k c delayed ->
+          Constr.delay_impure c (fun c -> k (c :: delayed)))
+        (fun delayed -> dps ~tail ~dst ~delayed)
+        delayed
+        []
+
+  let reify_delay (dps : tail:bool -> dst:lambda destination -> lambda) : lambda t =
+    fun ~tail ~dst ~delayed ->
+    match delayed with
+    | [] -> dps ~tail ~dst 
+    | x :: xs ->
+        Constr.with_placeholder x @@ fun block_dst block ->
+            Lsequence (
+              write_to_dst dst xs block,
+              dps ~tail ~dst:block_dst)
+
+  let map (f : 'a -> 'b) (dps : 'a t) : 'b t =
+    fun ~tail ~dst ~delayed ->
+      f @@ dps ~tail ~dst ~delayed
+
   let pair (fa : 'a t) (fb : 'b t) : ('a * 'b) t =
-    let dyna, dynb = run fa, run fb in
-    Dynamic (fun ~tail ~dst -> (dyna ~tail ~dst, dynb ~tail ~dst))
+    fun ~tail ~dst ~delayed ->
+      (fa ~tail ~dst ~delayed, fb ~tail ~dst ~delayed)
 end
 
 (** The TRMC transformation requires information flows in two opposite
@@ -317,21 +478,18 @@ end
     the actual code transformation in the {!choice} function.
 *)
 module Choice = struct
-  type 'a t =
-    | Return of 'a
-    (** [Return t] means that there are no TRMC opportunities in the subterm [t]:
-        no matter which context we are in,
-        we should evaluate [t] and "return" it. *)
-    | Set of 'a settable
-    (** [Set t] represents a piece of code that does contain
-        TRMC opportunities: if the context allows, we can write parts of
-        it in destination-passing-style to turn non-tail calls into tail
-        calls. See the type [settable] below. *)
+  type 'a t = {
+    dps : 'a Dps.t;
+    direct : unit -> 'a;
+    uses_dps : bool;
+    (* If false, there are no TRMC opportunities in the subterm.
+       No matter which context we are in, we should evaluate [direct ()] and "return" it. 
 
-  and 'a settable = {
-    dps: 'a Dps.t;
-    direct: unit -> 'a;
-    benefits_from_dps: bool;
+       Otherwise this is a piece of code which does contain TRMC opportunities.
+       If the context allows, we can write parts of it in destination-passing-style
+       to turn non-tail calls into tail calls. *)
+    is_linear : bool;
+    benefits_from_dps : bool;
     explicit_tailcall_request: bool;
   }
   (**
@@ -365,60 +523,119 @@ module Choice = struct
      exactly one of them will be annotated by the user, or fail
      because the situation is ambiguous.
   *)
+  (* If the surrounding context is already in destination-passing style, 
+      it has a destination available, and we should produce the code in [dps] --
+      a function parameterized over the destination.  The [tail] boolean indicates
+      whether the produced code is used in tail position.
 
-  let map_settable f s = {
-    direct = (fun () -> f (s.direct ()));
-    dps = Dps.map f s.dps;
-    benefits_from_dps = s.benefits_from_dps;
-    explicit_tailcall_request = s.explicit_tailcall_request;
+      If the surrounding context is in direct style (no destination is available),
+      we should produce the fallback code from [direct].
+
+      (Note: [direct] is also a function (on [unit]) to ensure that any
+      effects performed during code production will only happen once we
+      do know that we want to produce the direct-style code.)
+
+      The [uses_dps] boolean indicates whether the function contains at
+      least one TRMC sub-call in its [dps] version.  If [false], there is no
+      reason to use the [dps] version at all.
+
+      The [benefits_from_dps] boolean indicates whether the use of destination-passing-style
+      is beneficial to this function, in the sense that the [dps] version has strictly more
+      recursive calls to TRMC versions than the [direct] version.  When [benefits_from_dps]
+      is [false], there is no difference in the number of TRMC sub-calls -- see the
+      {!choice_makeblock} case.
+
+      The [is_linear] boolean indicates whether the function makes a single use
+      of its destination.  If [false], calling the [dps] version with delayed constructors
+      will cause code duplication.
+
+      The [explicit_tailcall_request] boolean is true when the user
+      used a [@tailcall] annotation on the optimizable callsite.
+      When one of several calls could be optimized, we expect that
+      exactly one of them will be annotated by the user, or fail
+      because the situation is ambiguous.
+  *)
+
+  let ensures_linear (c : lambda t) : lambda t =
+    if c.is_linear then 
+      c 
+    else { c with
+      dps = Dps.reify_delay (fun ~tail ~dst -> c.dps ~tail ~dst ~delayed:[]); 
+      is_linear = true
+    }
+  (** Ensures that the resulting term makes linear use of the delayed
+      constructors by applying them now if needed.
+   *)
+
+  let map_pure f s = {
+      dps = Dps.map f s.dps;
+      direct = (fun () -> f @@ s.direct ());
+      is_linear = s.is_linear;
+      uses_dps = s.uses_dps;
+      benefits_from_dps = s.benefits_from_dps;
+      explicit_tailcall_request = s.explicit_tailcall_request;
+  }
+  (** Apply function [f] to the transformed term.
+    
+      [f] must be "pure" with respect to the delayed constructors, that is,
+      it must not move delayed constructors into effectful contexts.
+    *)
+
+  let map_impure (f : 'a -> lambda) (s : 'a t) : lambda t =
+    let c = map_pure f s in
+    { c with dps = Dps.delay_impure c.dps }
+  (** Apply function [f] to the transformed term.
+    
+     [f] might create an effectful context, and hence all potentially effectful
+     arguments to delayed constructors will be let-bound before being passed onto
+     the context
+    *)
+
+  let return v = {
+    dps = Dps.return v;
+    direct = (fun () -> v);
+    uses_dps = false;
+    is_linear = true;
+    benefits_from_dps = false;
+    explicit_tailcall_request = false;
   }
 
-  let map f = function
-    | Return t -> Return (f t)
-    | Set s -> Set (map_settable f s)
+  let empty v = {
+    dps = Dps.empty v;
+    direct = (fun () -> v);
+    uses_dps = false;
+    is_linear = false;
+    benefits_from_dps = false;
+    explicit_tailcall_request = false;
+  }
 
-  let pair ((c1, c2) : 'a t * 'b t) : ('a * 'b) t =
-    match c1, c2 with
-    | Return v1, Return v2 -> Return (v1, v2)
-    | Set s1, Return v2 ->
-        Set (map_settable (fun v1 -> (v1, v2)) s1)
-    | Return v1, Set s2 ->
-        Set (map_settable (fun v2 -> (v1, v2)) s2)
-    | Set s1, Set s2 ->
-        Set {
-          direct = (fun () -> s1.direct (), s2.direct ());
-          dps = Dps.pair s1.dps s2.dps;
-          benefits_from_dps =
-            s1.benefits_from_dps || s2.benefits_from_dps;
-          explicit_tailcall_request =
-            s1.explicit_tailcall_request || s2.explicit_tailcall_request;
-        }
-
-  let (let+) c f = map f c
-  let (and+) c1 c2 = pair (c1, c2)
+  let pair (c1, c2) =
+    {
+      dps = Dps.pair c1.dps c2.dps;
+      direct = (fun () -> (c1.direct (), c2.direct ()));
+      is_linear = false;
+      uses_dps = c1.uses_dps || c2.uses_dps;
+      benefits_from_dps = c1.benefits_from_dps || c2.benefits_from_dps;
+      explicit_tailcall_request = c1.explicit_tailcall_request || c2.explicit_tailcall_request;
+    }
 
   let option (c : 'a t option) : 'a option t =
     match c with
-    | None -> Return None
-    | Some c -> let+ v = c in Some v
+    | None -> empty None
+    | Some c -> map_pure (fun v -> Some v) c
 
   let rec list (c : 'a t list) : 'a list t =
     match c with
-    | [] -> Return []
-    | c::cs ->
-        let+ v = c
-        and+ vs = list cs in
-        v :: vs
+    | [] -> empty []
+    | c :: cs ->
+        map_pure
+          (fun (v, vs) -> v :: vs)
+          (pair (c, list cs))
 
-  let direct : lambda t -> lambda = function
-    | Return t -> t
-    | Set settable -> settable.direct ()
+  let direct (c : lambda t) : lambda = c.direct ()
 
-  let dps loc : lambda t -> lambda Dps.dynamic = function
-    | Return t ->
-        (fun ~tail:_ ~dst -> assign_to_dst loc dst t)
-    | Set settable ->
-        Dps.run settable.dps
+  let dps (c : lambda t) ~tail ~dst =
+    c.dps ~tail:tail ~dst:dst ~delayed:[]
 
   (** The [find_*] machinery is used to locate a single settable subterm
       to optimize among a list of subterms. If there are several possible choices,
@@ -426,10 +643,10 @@ module Choice = struct
       we report an ambiguity. *)
   type 'a find_settable_result =
     | All_returns of 'a list
-    | Nonambiguous of 'a settable_zipper
-    | Ambiguous of 'a settable list
-  and 'a settable_zipper =
-    { rev_before : 'a list; settable : 'a settable; after : 'a list }
+    | Nonambiguous of 'a zipper
+    | Ambiguous of 'a t list
+  and 'a zipper =
+    { rev_before : 'a list; settable : 'a t; after : 'a list }
 
   let find_nonambiguous_settable choices =
     let is_explicit s = s.explicit_tailcall_request in
@@ -439,13 +656,13 @@ module Choice = struct
          an explicit request was necessary to disambiguate *)
       let rec split rev_before : 'a t list -> _ = function
         | [] -> assert false (* we know there is at least one settable *)
-        | Set s :: rest when (not explicit || is_explicit s) ->
-            { rev_before; settable = s; after = List.map direct rest }
+        | c :: rest when (c.uses_dps && (not explicit || is_explicit c)) ->
+            { rev_before; settable = c; after = List.map direct rest }
         | c :: rest -> split (direct c :: rev_before) rest
       in split [] choices
     in
     let settable_subterms =
-      List.filter_map (function Return _ -> None | Set s -> Some s) choices
+      List.filter (function c -> c.uses_dps) choices
     in
     match settable_subterms with
     | [] ->
@@ -462,7 +679,8 @@ module Choice = struct
         end
 end
 
-let (let+), (and+) = Choice.((let+), (and+))
+let (let+) c f = Choice.map_impure f c
+let (and+) c1 c2 = Choice.pair (c1, c2)
 
 type context = {
   specialized: specialized Ident.Map.t;
@@ -471,9 +689,6 @@ and specialized = {
   arity: int;
   dps_id: Ident.t;
 }
-
-let trmc_placeholder = Lconst (Const_base (Const_int 0))
-(* TODO consider using a more magical constant like 42, for debugging? *)
 
 let find_specialized = function
   | Lfunction lfun when lfun.attr.trmc_candidate -> Some lfun
@@ -490,92 +705,91 @@ let declare_binding ctx (var, def) =
 
 let rec choice ctx t =
   let rec choice ctx ~tail t =
-    begin[@warning "-8"]
-      (*FIXME: allows non-exhaustive pattern matching;
-        use an overkill functor-based solution instead? *)
-      match t with
-      | (Lvar _ | Lconst _ | Lfunction _ | Lsend _
-        | Lassign _ | Lfor _ | Lwhile _) ->
-          let t = traverse ctx t in
-          Choice.Return t
+    Choice.ensures_linear @@
+    match t with
+    | (Lvar _ | Lconst _ | Lfunction _ | Lsend _
+      | Lassign _ | Lfor _ | Lwhile _) ->
+        let t = traverse ctx t in
+        Choice.return t
 
-      (* [choice_prim] handles most primitives, but the important case of construction
-         [Lprim(Pmakeblock(...), ...)] is handled by [choice_makeblock] *)
-      | Lprim (prim, primargs, loc) ->
-          choice_prim ctx ~tail prim primargs loc
+    (* [choice_prim] handles most primitives, but the important case of construction
+       [Lprim(Pmakeblock(...), ...)] is handled by [choice_makeblock] *)
+    | Lprim (prim, primargs, loc) ->
+        choice_prim ctx ~tail prim primargs loc
 
-      (* [choice_apply] handles applications, in particular tail-calls which
-         generate Set choices at the leaves *)
-      | Lapply apply ->
-          choice_apply ctx ~tail apply
-      (* other cases use the [lift] helper that takes the sub-terms in tail
-         position and the context around them, and generates a choice for
-         the whole term from choices for the tail subterms. *)
-      | Lsequence (l1, l2) ->
-          let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx ~tail l2 in
-          Lsequence (l1, l2)
-      | Lifthenelse (l1, l2, l3) ->
-          let l1 = traverse ctx l1 in
-          let+ (l2, l3) = choice_pair ctx ~tail (l2, l3) in
-          Lifthenelse (l1, l2, l3)
-      | Llet (lk, vk, var, def, body) ->
-          (* non-recursive bindings are not specialized *)
-          let def = traverse ctx def in
-          let+ body = choice ctx ~tail body in
-          Llet (lk, vk, var, def, body)
-      | Lletrec (bindings, body) ->
-          let ctx, bindings = traverse_letrec ctx bindings in
-          let+ body = choice ctx ~tail body in
-          Lletrec(bindings, body)
-      | Lswitch (l1, sw, loc) ->
-          (* decompose *)
-          let consts_lhs, consts_rhs = List.split sw.sw_consts in
-          let blocks_lhs, blocks_rhs = List.split sw.sw_blocks in
-          (* transform *)
-          let l1 = traverse ctx l1 in
-          let+ consts_rhs = choice_list ctx ~tail consts_rhs
-          and+ blocks_rhs = choice_list ctx ~tail blocks_rhs
-          and+ sw_failaction = choice_option ctx ~tail sw.sw_failaction in
-          (* rebuild *)
-          let sw_consts = List.combine consts_lhs consts_rhs in
-          let sw_blocks = List.combine blocks_lhs blocks_rhs in
-          let sw = { sw with sw_consts; sw_blocks; sw_failaction; } in
-          Lswitch (l1, sw, loc)
-      | Lstringswitch (l1, cases, fail, loc) ->
-          (* decompose *)
-          let cases_lhs, cases_rhs = List.split cases in
-          (* transform *)
-          let l1 = traverse ctx l1 in
-          let+ cases_rhs = choice_list ctx ~tail cases_rhs
-          and+ fail = choice_option ctx ~tail fail in
-          (* rebuild *)
-          let cases = List.combine cases_lhs cases_rhs in
-          Lstringswitch (l1, cases, fail, loc)
-      | Lstaticraise (id, ls) ->
-          let ls = traverse_list ctx ls in
-          Choice.Return (Lstaticraise (id, ls))
-      | Ltrywith (l1, id, l2) ->
-          (* in [try l1 with id -> l2], the term [l1] is
-             not in tail-call position (after it returns
-             we need to remove the exception handler),
-             so it is not transformed here *)
-          let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx ~tail l2 in
-          Ltrywith (l1, id, l2)
-      | Lstaticcatch (l1, ids, l2) ->
-          (* In [static-catch l1 with ids -> l2],
-             the term [l1] is in fact in tail-position *)
-          let+ l1 = choice ctx ~tail l1
-          and+ l2 = choice ctx ~tail l2 in
-          Lstaticcatch (l1, ids, l2)
-      | Levent (lam, lev) ->
-          let+ lam = choice ctx ~tail lam in
-          Levent (lam, lev)
-      | Lifused (x, lam) ->
-          let+ lam = choice ctx ~tail lam in
-          Lifused (x, lam)
-    end
+    (* [choice_apply] handles applications, in particular tail-calls which
+       generate Set choices at the leaves *)
+    | Lapply apply ->
+        choice_apply ctx ~tail apply
+    (* other cases use the [lift] helper that takes the sub-terms in tail
+       position and the context around them, and generates a choice for
+       the whole term from choices for the tail subterms. *)
+    | Lsequence (l1, l2) ->
+        let l1 = traverse ctx l1 in
+        let+ l2 = choice ctx ~tail l2 in
+        Lsequence (l1, l2)
+    | Lifthenelse (l1, l2, l3) ->
+        let l1 = traverse ctx l1 in
+        let+ (l2, l3) = choice_pair ctx ~tail (l2, l3) in
+        Lifthenelse (l1, l2, l3)
+    | Llet (lk, vk, var, def, body) ->
+        (* non-recursive bindings are not specialized *)
+        let def = traverse ctx def in
+        let+ body = choice ctx ~tail body in
+        Llet (lk, vk, var, def, body)
+    | Lletrec (bindings, body) ->
+        let ctx, bindings = traverse_letrec ctx bindings in
+        let+ body = choice ctx ~tail body in
+        Lletrec(bindings, body)
+    | Lswitch (l1, sw, loc) ->
+        (* decompose *)
+        let consts_lhs, consts_rhs = List.split sw.sw_consts in
+        let blocks_lhs, blocks_rhs = List.split sw.sw_blocks in
+        (* transform *)
+        let l1 = traverse ctx l1 in
+        let+ consts_rhs = choice_list ctx ~tail consts_rhs
+        and+ blocks_rhs = choice_list ctx ~tail blocks_rhs
+        and+ sw_failaction = choice_option ctx ~tail sw.sw_failaction in
+        (* rebuild *)
+        let sw_consts = List.combine consts_lhs consts_rhs in
+        let sw_blocks = List.combine blocks_lhs blocks_rhs in
+        let sw = { sw with sw_consts; sw_blocks; sw_failaction; } in
+        Lswitch (l1, sw, loc)
+    | Lstringswitch (l1, cases, fail, loc) ->
+        (* decompose *)
+        let cases_lhs, cases_rhs = List.split cases in
+        (* transform *)
+        let l1 = traverse ctx l1 in
+        let+ cases_rhs = choice_list ctx ~tail cases_rhs
+        and+ fail = choice_option ctx ~tail fail in
+        (* rebuild *)
+        let cases = List.combine cases_lhs cases_rhs in
+        Lstringswitch (l1, cases, fail, loc)
+    | Lstaticraise (id, ls) ->
+        let ls = traverse_list ctx ls in
+        Choice.return (Lstaticraise (id, ls))
+    | Ltrywith (l1, id, l2) ->
+        (* in [try l1 with id -> l2], the term [l1] is
+           not in tail-call position (after it returns
+           we need to remove the exception handler),
+           so it is not transformed here *)
+        let l1 = traverse ctx l1 in
+        let+ l2 = choice ctx ~tail l2 in
+        Ltrywith (l1, id, l2)
+    | Lstaticcatch (l1, ids, l2) ->
+        (* In [static-catch l1 with ids -> l2],
+           the term [l1] is in fact in tail-position *)
+        let+ l1 = choice ctx ~tail l1
+        and+ l2 = choice ctx ~tail l2 in
+        Lstaticcatch (l1, ids, l2)
+    | Levent (lam, lev) ->
+        (* We can move effectful delayed constructors across events *)
+        Choice.map_pure
+          (fun lam -> Levent (lam, lev))
+          (choice ctx ~tail lam)
+    | Lifused (x, lam) ->
+        let+ lam = choice ctx ~tail lam in
+        Lifused (x, lam)
 
   and choice_apply ctx ~tail apply =
     let exception No_TRMC in
@@ -600,53 +814,52 @@ let rec choice ctx t =
                   Warnings.TRMC_breaks_tailcall;
               raise No_TRMC
           in
-          Choice.Set {
+          Choice.{
+            is_linear = true;
+            uses_dps = true;
             benefits_from_dps = true;
             explicit_tailcall_request;
-            dps = Dynamic (fun ~tail ~dst ->
-              let f_dps = specialized.dps_id in
+            dps = Dps.reify_delay @@ (fun ~tail ~dst ->
               Lapply { apply with
-                       ap_func = Lvar f_dps;
+                       ap_func = Lvar specialized.dps_id;
                        ap_args = add_dst_args dst apply.ap_args;
-                       ap_tailcall =
-		         if tail then Should_be_tailcall else Default_tailcall;
-                     });
+                       ap_tailcall=
+                         if tail then Should_be_tailcall else Default_tailcall;
+            });
             direct = (fun () -> Lapply apply);
           }
       | _nontail -> raise No_TRMC
-    with No_TRMC -> Choice.Return (Lapply apply)
+    with No_TRMC -> Choice.return (Lapply apply)
 
   and choice_makeblock ctx ~tail:_ (tag, flag, shape) blockargs loc =
-    let k new_flag new_block_args =
-      Lprim (Pmakeblock (tag, new_flag, shape), new_block_args, loc) in
     let choices = List.map (choice ~tail:false ctx) blockargs in
     match Choice.find_nonambiguous_settable choices with
     | Choice.Ambiguous subterms ->
-        let subterms = List.map (fun c -> c.Choice.direct ()) subterms in
+        let subterms = List.map Choice.direct subterms in
         raise (Error (Debuginfo.Scoped_location.to_location loc,
                       Ambiguous_constructor_arguments subterms))
     | Choice.All_returns all_returns ->
-        let all_returns = traverse_list ctx all_returns in
-        Choice.Return (k flag all_returns)
+        Choice.return @@ Lprim (Pmakeblock (tag, flag, shape), all_returns, loc)
     | Choice.Nonambiguous { Choice.rev_before; settable; after } ->
-        let before = traverse_list ctx (List.rev rev_before) in
-        let after = traverse_list ctx after in
-        let plug_args before t after =
-          List.append before @@ t :: after in
-        let k_with_placeholder =
-          k Mutable (plug_args before trmc_placeholder after)
-        in
-        let placeholder_pos = List.length before in
-        let placeholder_pos_lam = Lconst (Const_base (Const_int placeholder_pos)) in
-        let let_block_in body =
-          let block_var = Ident.create_local "block" in
-          Llet(Strict, Pgenval, block_var, k_with_placeholder,
-               body block_var)
-        in
-        let block_dst block_var = { var = block_var; offset = placeholder_pos_lam } in
-        Choice.Set {
+        let con = Constr.{
+            tag = tag;
+            flag = flag;
+            shape = shape;
+            before = List.rev rev_before;
+            after = after;
+            loc = loc
+        } in
+        assert settable.uses_dps;
+
+        Choice.{
           explicit_tailcall_request =
             settable.explicit_tailcall_request;
+          uses_dps = 
+            (* The underlying settable must use dps, because that is what the
+               [find_nonambiguous_settable] function looks for. *)
+            true;
+          is_linear =
+            settable.is_linear;
           benefits_from_dps =
             (* Whether or not the caller provides a destination,
                we can always provide a destination to our settable
@@ -655,140 +868,97 @@ let rec choice ctx t =
             false;
           direct = (fun () ->
             if not settable.benefits_from_dps then
-              k flag (plug_args before (settable.direct ()) after)
+              Constr.apply con (direct settable)
             else
-              let_block_in @@ fun block_var ->
-              Lsequence(Dps.run settable.dps ~tail:false ~dst:(block_dst block_var),
-                        Lvar block_var)
+              Constr.with_placeholder con @@ fun block_dst block ->
+              Lsequence(dps settable ~tail:false ~dst:block_dst,
+                        block)
           );
-          dps = Linear_static (fun ~tail ~dst ~delayed ->
-            match settable.dps with
-            | Dynamic dps ->
-                let_block_in @@ fun block_var ->
-                Lsequence(assign_to_dst loc dst (delayed (Lvar block_var)),
-                          dps ~tail ~dst:(block_dst block_var))
-            | Linear_static dps ->
-                (* We are going to delay the application of the
-                   constructor to the place where our linear-static
-                   argument sets its destination. This may move the
-                   constructor application below some effectful
-                   expressions (if our subterm is of the form [foo;
-                   bar_with_trmc_inside] for example), and we want to
-                   preserve the evaluation order of the other
-                   arguments of the constructor. So we bind them here,
-                   unless are obviously side-effect-frees. *)
-                let bind_list name lambdas k =
-                  let can_be_delayed =
-                    (* Note that the delayed subterms will be used
-                       exactly once in the linear-static subterm. So
-                       we are happy to delay constants, which we would
-                       not want to duplicate. *)
-                    function
-                    | Lvar _ | Lconst _ -> true
-                    | _ -> false in
-                  let bindings, args =
-                    lambdas
-                    |> List.mapi (fun i lam ->
-                      if can_be_delayed lam then (None, lam)
-                      else begin
-                        let v = Ident.create_local (Printf.sprintf "arg_%s_%d" name i) in
-                        (Some (v, lam), Lvar v)
-                      end)
-                    |> List.split in
-                  let body = k args in
-                  List.fold_right (fun binding body ->
-                    match binding with
-                    | None -> body
-                    | Some (v, lam) -> Llet(Strict, Pgenval, v, lam, body)
-                  ) bindings body
-                in
-                bind_list "before" before @@ fun vbefore ->
-                bind_list "after" after @@ fun vafter ->
-                dps ~tail ~dst ~delayed:(fun t ->
-                  delayed (k flag (plug_args vbefore t vafter)))
-          );
+          dps = (fun ~tail ~dst ~delayed ->
+            settable.dps ~tail ~dst ~delayed:(con :: delayed));
         }
 
   and choice_prim ctx ~tail prim primargs loc =
-    begin [@warning "-8"] (* see choice *)
-      match prim with
-      (* The important case is the construction case *)
-      | Pmakeblock (tag, flag, shape) ->
-          choice_makeblock ctx ~tail (tag, flag, shape) primargs loc
+    match prim with
+    (* The important case is the construction case *)
+    | Pmakeblock (tag, flag, shape) ->
+        choice_makeblock ctx ~tail (tag, flag, shape) primargs loc
 
-      (* Some primitives have arguments in tail-position *)
-      | (Pidentity | Popaque) as idop ->
-          let l1 = match primargs with
-            |  [l1] -> l1
-            | _ -> invalid_arg "choice_prim" in
-          let+ l1 = choice ctx ~tail l1 in
-          Lprim (idop, [l1], loc)
-      | (Psequand | Psequor) as shortcutop ->
-          let l1, l2 = match primargs with
-            |  [l1; l2] -> l1, l2
-            | _ -> invalid_arg "choice_prim" in
-          let l1 = traverse ctx l1 in
-          let+ l2 = choice ctx ~tail l2 in
-          Lprim (shortcutop, [l1; l2], loc)
+    (* Some primitives have arguments in tail-position *)
+    | (Pidentity | Popaque) as idop ->
+        let l1 = match primargs with
+          |  [l1] -> l1
+          | _ -> invalid_arg "choice_prim" in
+        let+ l1 = choice ctx ~tail l1 in
+        Lprim (idop, [l1], loc)
+    | (Psequand | Psequor) as shortcutop ->
+        let l1, l2 = match primargs with
+          |  [l1; l2] -> l1, l2
+          | _ -> invalid_arg "choice_prim" in
+        let l1 = traverse ctx l1 in
+        let+ l2 = choice ctx ~tail l2 in
+        Lprim (shortcutop, [l1; l2], loc)
 
-      (* in common cases we just Return *)
-      | Pbytes_to_string | Pbytes_of_string
-      | Pgetglobal _ | Psetglobal _
-      | Pfield _ | Pfield_computed
-      | Psetfield _ | Psetfield_computed _
-      | Pfloatfield _ | Psetfloatfield _
-      | Pccall _
-      | Praise _
-      | Pnot
-      | Pnegint | Paddint | Psubint | Pmulint | Pdivint _ | Pmodint _
-      | Pandint | Porint | Pxorint
-      | Plslint | Plsrint | Pasrint
-      | Pintcomp _
-      | Poffsetint _ | Poffsetref _
-      | Pintoffloat | Pfloatofint
-      | Pnegfloat | Pabsfloat
-      | Paddfloat | Psubfloat | Pmulfloat | Pdivfloat
-      | Pfloatcomp _
-      | Pstringlength | Pstringrefu  | Pstringrefs
-      | Pbyteslength | Pbytesrefu | Pbytessetu | Pbytesrefs | Pbytessets
-      | Parraylength _ | Parrayrefu _ | Parraysetu _ | Parrayrefs _ | Parraysets _
-      | Pisint | Pisout
+    (* in common cases we just return *)
+    | Pbytes_to_string | Pbytes_of_string
+    | Pgetglobal _ | Psetglobal _
+    | Pfield _ | Pfield_computed
+    | Psetfield _ | Psetfield_computed _
+    | Pfloatfield _ | Psetfloatfield _
+    | Pccall _
+    | Praise _
+    | Pnot
+    | Pnegint | Paddint | Psubint | Pmulint | Pdivint _ | Pmodint _
+    | Pandint | Porint | Pxorint
+    | Plslint | Plsrint | Pasrint
+    | Pintcomp _
+    | Poffsetint _ | Poffsetref _
+    | Pintoffloat | Pfloatofint
+    | Pnegfloat | Pabsfloat
+    | Paddfloat | Psubfloat | Pmulfloat | Pdivfloat
+    | Pfloatcomp _
+    | Pstringlength | Pstringrefu  | Pstringrefs
+    | Pbyteslength | Pbytesrefu | Pbytessetu | Pbytesrefs | Pbytessets
+    | Parraylength _ | Parrayrefu _ | Parraysetu _ | Parrayrefs _ | Parraysets _
+    | Pisint | Pisout
 
-      (* we don't handle array indices as destinations yet *)
-      | (Pmakearray _ | Pduparray _)
+    (* we don't handle array indices as destinations yet *)
+    | (Pmakearray _ | Pduparray _)
 
-      (* we don't handle { foo with x = ...; y = recursive-call } *)
-      | Pduprecord _
+    (* we don't handle { foo with x = ...; y = recursive-call } *)
+    | Pduprecord _
 
-      | (
-        (* operations returning boxed values could be considered constructions someday *)
-        Pbintofint _ | Pintofbint _
-        | Pcvtbint _
-        | Pnegbint _
-        | Paddbint _ | Psubbint _ | Pmulbint _ | Pdivbint _ | Pmodbint _
-        | Pandbint _ | Porbint _ | Pxorbint _ | Plslbint _ | Plsrbint _ | Pasrbint _
-        | Pbintcomp _
-      )
-      | Pbigarrayref _ | Pbigarrayset _
-      | Pbigarraydim _
-      | Pstring_load_16 _ | Pstring_load_32 _ | Pstring_load_64 _
-      | Pbytes_load_16 _ | Pbytes_load_32 _ | Pbytes_load_64 _
-      | Pbytes_set_16 _ | Pbytes_set_32 _ | Pbytes_set_64 _
-      | Pbigstring_load_16 _ | Pbigstring_load_32 _ | Pbigstring_load_64 _
-      | Pbigstring_set_16 _ | Pbigstring_set_32 _ | Pbigstring_set_64 _ | Pctconst _
-      | Pbswap16
-      | Pbbswap _
-      | Pint_as_pointer
-        ->
-          let primargs = traverse_list ctx primargs in
-          Choice.Return (Lprim (prim, primargs, loc))
-    end
+    | (
+      (* operations returning boxed values could be considered constructions someday *)
+      Pbintofint _ | Pintofbint _
+      | Pcvtbint _
+      | Pnegbint _
+      | Paddbint _ | Psubbint _ | Pmulbint _ | Pdivbint _ | Pmodbint _
+      | Pandbint _ | Porbint _ | Pxorbint _ | Plslbint _ | Plsrbint _ | Pasrbint _
+      | Pbintcomp _
+    )
+    | Pbigarrayref _ | Pbigarrayset _
+    | Pbigarraydim _
+    | Pstring_load_16 _ | Pstring_load_32 _ | Pstring_load_64 _
+    | Pbytes_load_16 _ | Pbytes_load_32 _ | Pbytes_load_64 _
+    | Pbytes_set_16 _ | Pbytes_set_32 _ | Pbytes_set_64 _
+    | Pbigstring_load_16 _ | Pbigstring_load_32 _ | Pbigstring_load_64 _
+    | Pbigstring_set_16 _ | Pbigstring_set_32 _ | Pbigstring_set_64 _ | Pctconst _
+    | Pbswap16
+    | Pbbswap _
+    | Pint_as_pointer
+    (* TODO(gasche): Missed constructors due disabling exhaustivity checks.  I don't know
+       what they do. *)
+    | Pignore | Prevapply | Pdirapply | Pcompare_ints | Pcompare_floats | Pcompare_bints _
+      ->
+        let primargs = traverse_list ctx primargs in
+        Choice.return (Lprim (prim, primargs, loc))
 
-  and choice_list ctx ~tail terms =
+  and choice_list ctx ~tail (terms : lambda list) =
     Choice.list (List.map (choice ctx ~tail) terms)
-  and choice_pair ctx ~tail (t1, t2) =
+  and choice_pair ctx ~tail ((t1, t2) : (lambda * lambda)) = 
     Choice.pair (choice ctx ~tail t1, choice ctx ~tail t2)
-  and choice_option ctx ~tail t =
+  and choice_option ctx ~tail (t : lambda option) =
     Choice.option (Option.map (choice ctx ~tail) t)
 
   in choice ctx t
@@ -811,9 +981,7 @@ and traverse_binding ctx (var, def) =
   | Some lfun ->
   let cand = Ident.Map.find var ctx.specialized in
   let cand_choice = choice ctx ~tail:true lfun.body in
-  begin match cand_choice with
-  | Choice.Set _ -> ()
-  | Choice.Return _ ->
+  begin if not cand_choice.Choice.uses_dps then
       Location.prerr_warning
         (Debuginfo.Scoped_location.to_location lfun.loc)
         Warnings.Unused_TRMC_attribute;
@@ -824,11 +992,12 @@ and traverse_binding ctx (var, def) =
     let dst = {
       var = Ident.create_local "dst";
       offset = Ident.create_local "offset";
+      loc = lfun.loc;
     } in
     let dst_lam = { dst with offset = Lvar dst.offset } in
     Lambda.duplicate @@ Lfunction { lfun with (* TODO check function_kind *)
       params = add_dst_params dst lfun.params;
-      body = Choice.dps lfun.loc cand_choice ~tail:true ~dst:dst_lam;
+      body = Choice.dps cand_choice ~tail:true ~dst:dst_lam;
     } in
   let dps_var = cand.dps_id in
   [(var, direct); (dps_var, dps)]
